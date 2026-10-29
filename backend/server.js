@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express");
@@ -13,7 +14,28 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// MySQL connection with Aiven CA certificate
+// Validate required environment variables
+const requiredEnv = [
+  "DB_HOST",
+  "DB_USER",
+  "DB_PASSWORD",
+  "DB_NAME",
+  "JWT_SECRET"
+];
+
+const missingEnv = requiredEnv.filter(
+  (key) => !process.env[key]
+);
+
+if (missingEnv.length > 0) {
+  console.error(
+    "Missing environment variables:",
+    missingEnv.join(", ")
+  );
+  process.exit(1);
+}
+
+// MySQL connection pool for Aiven
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT) || 3306,
@@ -21,14 +43,18 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
   ssl: {
-    ca: fs.readFileSync(path.join(__dirname, "ca.pem"), "utf8"),
+    ca: fs.readFileSync(
+      path.join(__dirname, "ca.pem"),
+      "utf8"
+    ),
     rejectUnauthorized: true
   },
   waitForConnections: true,
-  connectionLimit: 10
+  connectionLimit: 10,
+  queueLimit: 0
 });
 
-// Check server and database connection
+// Health check
 app.get("/api/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
@@ -38,9 +64,13 @@ app.get("/api/health", async (req, res) => {
       database: "connected"
     });
   } catch (error) {
-    console.error("MYSQL HEALTH CHECK ERROR:", error);
+    console.error("MYSQL HEALTH CHECK ERROR:", {
+      message: error.message,
+      code: error.code
+    });
 
     res.status(500).json({
+      status: "error",
       message: "Database connection failed",
       code: error.code || "UNKNOWN"
     });
@@ -49,11 +79,17 @@ app.get("/api/health", async (req, res) => {
 
 // Register organization and first user
 app.post("/api/auth/register", async (req, res) => {
-  const { name, email, password, organizationName } = req.body;
+  const {
+    name,
+    email,
+    password,
+    organizationName
+  } = req.body;
 
   if (!name || !email || !password || !organizationName) {
     return res.status(400).json({
-      message: "Name, email, password and organizationName are required"
+      message:
+        "Name, email, password and organizationName are required"
     });
   }
 
@@ -74,7 +110,14 @@ app.post("/api/auth/register", async (req, res) => {
       [String(organizationName).trim()]
     );
 
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await bcrypt.hash(
+      String(password),
+      10
+    );
+
+    const normalizedEmail = String(email)
+      .trim()
+      .toLowerCase();
 
     const [userResult] = await connection.execute(
       `INSERT INTO users
@@ -83,7 +126,7 @@ app.post("/api/auth/register", async (req, res) => {
       [
         orgResult.insertId,
         String(name).trim(),
-        String(email).trim().toLowerCase(),
+        normalizedEmail,
         passwordHash
       ]
     );
@@ -99,13 +142,13 @@ app.post("/api/auth/register", async (req, res) => {
       { expiresIn: "8h" }
     );
 
-    res.status(201).json({
+    return res.status(201).json({
       message: "Registration successful",
       token,
       user: {
         id: userResult.insertId,
         name: String(name).trim(),
-        email: String(email).trim().toLowerCase(),
+        email: normalizedEmail,
         organizationId: orgResult.insertId,
         organizationName: String(organizationName).trim()
       }
@@ -121,10 +164,14 @@ app.post("/api/auth/register", async (req, res) => {
       });
     }
 
-    console.error("REGISTRATION ERROR:", error.message);
+    console.error("REGISTRATION ERROR:", {
+      message: error.message,
+      code: error.code
+    });
 
-    res.status(500).json({
-      message: "Registration failed"
+    return res.status(500).json({
+      message: "Registration failed",
+      code: error.code || "UNKNOWN"
     });
   } finally {
     if (connection) {
@@ -144,23 +191,36 @@ app.post("/api/auth/login", async (req, res) => {
   }
 
   try {
+    const normalizedEmail = String(email)
+      .trim()
+      .toLowerCase();
+
     const [users] = await pool.execute(
       `SELECT id, organization_id, name, email, password_hash
        FROM users
-       WHERE email = ?`,
-      [String(email).trim().toLowerCase()]
+       WHERE email = ?
+       LIMIT 1`,
+      [normalizedEmail]
     );
 
-    if (
-      users.length === 0 ||
-      !(await bcrypt.compare(password, users[0].password_hash))
-    ) {
+    if (users.length === 0) {
       return res.status(401).json({
         message: "Invalid email or password"
       });
     }
 
     const user = users[0];
+
+    const passwordMatches = await bcrypt.compare(
+      String(password),
+      user.password_hash
+    );
+
+    if (!passwordMatches) {
+      return res.status(401).json({
+        message: "Invalid email or password"
+      });
+    }
 
     const token = jwt.sign(
       {
@@ -171,7 +231,7 @@ app.post("/api/auth/login", async (req, res) => {
       { expiresIn: "8h" }
     );
 
-    res.json({
+    return res.json({
       message: "Login successful",
       token,
       user: {
@@ -182,10 +242,15 @@ app.post("/api/auth/login", async (req, res) => {
       }
     });
   } catch (error) {
-    console.error("LOGIN ERROR:", error.message);
+    console.error("LOGIN ERROR:", {
+      message: error.message,
+      code: error.code,
+      sqlMessage: error.sqlMessage
+    });
 
-    res.status(500).json({
-      message: "Login failed"
+    return res.status(500).json({
+      message: "Login failed",
+      code: error.code || "UNKNOWN"
     });
   }
 });
@@ -206,7 +271,11 @@ function authenticateToken(req, res, next) {
   }
 
   try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = jwt.verify(
+      token,
+      process.env.JWT_SECRET
+    );
+
     next();
   } catch (error) {
     return res.status(401).json({
@@ -219,19 +288,22 @@ function authenticateToken(req, res, next) {
 app.get("/api/products", authenticateToken, async (req, res) => {
   try {
     const [products] = await pool.execute(
-      `SELECT id, name, sku, quantity, price, low_stock_threshold,
-              created_at, updated_at
+      `SELECT id, name, sku, quantity, price,
+              low_stock_threshold, created_at, updated_at
        FROM products
        WHERE organization_id = ?
        ORDER BY id DESC`,
       [req.user.organizationId]
     );
 
-    res.json(products);
+    return res.json(products);
   } catch (error) {
-    console.error("FETCH PRODUCTS ERROR:", error.message);
+    console.error("FETCH PRODUCTS ERROR:", {
+      message: error.message,
+      code: error.code
+    });
 
-    res.status(500).json({
+    return res.status(500).json({
       message: "Could not fetch products"
     });
   }
@@ -262,7 +334,8 @@ app.post("/api/products", authenticateToken, async (req, res) => {
     Number(low_stock_threshold) < 0
   ) {
     return res.status(400).json({
-      message: "Quantity, price and threshold must be valid non-negative numbers"
+      message:
+        "Quantity, price and threshold must be valid non-negative numbers"
     });
   }
 
@@ -281,7 +354,7 @@ app.post("/api/products", authenticateToken, async (req, res) => {
       ]
     );
 
-    res.status(201).json({
+    return res.status(201).json({
       message: "Product created successfully",
       id: result.insertId
     });
@@ -292,9 +365,12 @@ app.post("/api/products", authenticateToken, async (req, res) => {
       });
     }
 
-    console.error("CREATE PRODUCT ERROR:", error.message);
+    console.error("CREATE PRODUCT ERROR:", {
+      message: error.message,
+      code: error.code
+    });
 
-    res.status(500).json({
+    return res.status(500).json({
       message: "Could not create product"
     });
   }
@@ -321,7 +397,8 @@ app.put("/api/products/:id", authenticateToken, async (req, res) => {
     Number(low_stock_threshold) < 0
   ) {
     return res.status(400).json({
-      message: "Provide valid name, SKU, quantity, price and low-stock threshold"
+      message:
+        "Provide valid name, SKU, quantity, price and low-stock threshold"
     });
   }
 
@@ -356,7 +433,7 @@ app.put("/api/products/:id", authenticateToken, async (req, res) => {
       }
     }
 
-    res.json({
+    return res.json({
       message: "Product updated successfully"
     });
   } catch (error) {
@@ -366,9 +443,12 @@ app.put("/api/products/:id", authenticateToken, async (req, res) => {
       });
     }
 
-    console.error("UPDATE PRODUCT ERROR:", error.message);
+    console.error("UPDATE PRODUCT ERROR:", {
+      message: error.message,
+      code: error.code
+    });
 
-    res.status(500).json({
+    return res.status(500).json({
       message: "Could not update product"
     });
   }
@@ -380,7 +460,10 @@ app.delete("/api/products/:id", authenticateToken, async (req, res) => {
     const [result] = await pool.execute(
       `DELETE FROM products
        WHERE id = ? AND organization_id = ?`,
-      [req.params.id, req.user.organizationId]
+      [
+        req.params.id,
+        req.user.organizationId
+      ]
     );
 
     if (result.affectedRows === 0) {
@@ -389,13 +472,16 @@ app.delete("/api/products/:id", authenticateToken, async (req, res) => {
       });
     }
 
-    res.json({
+    return res.json({
       message: "Product deleted successfully"
     });
   } catch (error) {
-    console.error("DELETE PRODUCT ERROR:", error.message);
+    console.error("DELETE PRODUCT ERROR:", {
+      message: error.message,
+      code: error.code
+    });
 
-    res.status(500).json({
+    return res.status(500).json({
       message: "Could not delete product"
     });
   }
@@ -409,12 +495,14 @@ app.get("/api/dashboard", authenticateToken, async (req, res) => {
          COUNT(*) AS totalProducts,
          COALESCE(SUM(quantity), 0) AS totalUnits,
          COALESCE(SUM(quantity * price), 0) AS inventoryValue,
-         COALESCE(SUM(
-           CASE
-             WHEN quantity <= low_stock_threshold THEN 1
-             ELSE 0
-           END
-         ), 0) AS lowStockCount
+         COALESCE(
+           SUM(
+             CASE
+               WHEN quantity <= low_stock_threshold THEN 1
+               ELSE 0
+             END
+           ), 0
+         ) AS lowStockCount
        FROM products
        WHERE organization_id = ?`,
       [req.user.organizationId]
@@ -429,22 +517,32 @@ app.get("/api/dashboard", authenticateToken, async (req, res) => {
       [req.user.organizationId]
     );
 
-    res.json({
+    return res.json({
       ...totals[0],
       lowStockProducts
     });
   } catch (error) {
-    console.error("DASHBOARD ERROR:", error.message);
+    console.error("DASHBOARD ERROR:", {
+      message: error.message,
+      code: error.code
+    });
 
-    res.status(500).json({
+    return res.status(500).json({
       message: "Could not load dashboard"
     });
   }
 });
 
+// Handle unknown API routes
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    message: "API endpoint not found"
+  });
+});
+
 // Start server
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`StockFlow server running on port ${PORT}`);
 });
