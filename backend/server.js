@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -6,33 +5,49 @@ const mysql = require("mysql2/promise");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-const pool =mysql.createPool({
+// MySQL connection with Aiven CA certificate
+const pool = mysql.createPool({
   host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT) || 3306,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
+  ssl: {
+    ca: fs.readFileSync(path.join(__dirname, "ca.pem"), "utf8"),
+    rejectUnauthorized: true
+  },
   waitForConnections: true,
   connectionLimit: 10
 });
 
-// Check server and databaseA long, random secret of your own
+// Check server and database connection
 app.get("/api/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({ status: "ok", database: "connected" });
+
+    res.json({
+      status: "ok",
+      database: "connected"
+    });
   } catch (error) {
-    console.error(error.message);
-    res.status(500).json({ message: "Database connection failed" });
+    console.error("MYSQL HEALTH CHECK ERROR:", error);
+
+    res.status(500).json({
+      message: "Database connection failed",
+      code: error.code || "UNKNOWN"
+    });
   }
 });
 
-// Create an organization and its first user
+// Register organization and first user
 app.post("/api/auth/register", async (req, res) => {
   const { name, email, password, organizationName } = req.body;
 
@@ -48,9 +63,10 @@ app.post("/api/auth/register", async (req, res) => {
     });
   }
 
-  const connection = await pool.getConnection();
+  let connection;
 
   try {
+    connection = await pool.getConnection();
     await connection.beginTransaction();
 
     const [orgResult] = await connection.execute(
@@ -95,7 +111,9 @@ app.post("/api/auth/register", async (req, res) => {
       }
     });
   } catch (error) {
-    await connection.rollback();
+    if (connection) {
+      await connection.rollback().catch(() => {});
+    }
 
     if (error.code === "ER_DUP_ENTRY") {
       return res.status(409).json({
@@ -103,14 +121,19 @@ app.post("/api/auth/register", async (req, res) => {
       });
     }
 
-    console.error(error.message);
-    res.status(500).json({ message: "Registration failed" });
+    console.error("REGISTRATION ERROR:", error.message);
+
+    res.status(500).json({
+      message: "Registration failed"
+    });
   } finally {
-    connection.release();
+    if (connection) {
+      connection.release();
+    }
   }
 });
 
-// Log in
+// Login
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
 
@@ -123,7 +146,8 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const [users] = await pool.execute(
       `SELECT id, organization_id, name, email, password_hash
-       FROM users WHERE email = ?`,
+       FROM users
+       WHERE email = ?`,
       [String(email).trim().toLowerCase()]
     );
 
@@ -158,17 +182,22 @@ app.post("/api/auth/login", async (req, res) => {
       }
     });
   } catch (error) {
-    console.error(error.message);
-    res.status(500).json({ message: "Login failed" });
+    console.error("LOGIN ERROR:", error.message);
+
+    res.status(500).json({
+      message: "Login failed"
+    });
   }
 });
 
-// Authentication middleware for protected routes
+// Authentication middleware
 function authenticateToken(req, res, next) {
   const header = req.headers.authorization;
-  const token = header && header.startsWith("Bearer ")
-    ? header.slice(7)
-    : null;
+
+  const token =
+    header && header.startsWith("Bearer ")
+      ? header.slice(7)
+      : null;
 
   if (!token) {
     return res.status(401).json({
@@ -186,7 +215,7 @@ function authenticateToken(req, res, next) {
   }
 }
 
-// Get products belonging only to the logged-in user's organization
+// Get products for the logged-in user's organization
 app.get("/api/products", authenticateToken, async (req, res) => {
   try {
     const [products] = await pool.execute(
@@ -200,15 +229,22 @@ app.get("/api/products", authenticateToken, async (req, res) => {
 
     res.json(products);
   } catch (error) {
-    console.error(error.message);
-    res.status(500).json({ message: "Could not fetch products" });
+    console.error("FETCH PRODUCTS ERROR:", error.message);
+
+    res.status(500).json({
+      message: "Could not fetch products"
+    });
   }
 });
 
-// Add a product
+// Add product
 app.post("/api/products", authenticateToken, async (req, res) => {
   const {
-    name, sku, quantity = 0, price = 0, low_stock_threshold = 5
+    name,
+    sku,
+    quantity = 0,
+    price = 0,
+    low_stock_threshold = 5
   } = req.body;
 
   if (!name || !sku) {
@@ -256,19 +292,31 @@ app.post("/api/products", authenticateToken, async (req, res) => {
       });
     }
 
-    console.error(error.message);
-    res.status(500).json({ message: "Could not create product" });
+    console.error("CREATE PRODUCT ERROR:", error.message);
+
+    res.status(500).json({
+      message: "Could not create product"
+    });
   }
 });
 
-// Update a product
+// Update product
 app.put("/api/products/:id", authenticateToken, async (req, res) => {
-  const { name, sku, quantity, price, low_stock_threshold } = req.body;
+  const {
+    name,
+    sku,
+    quantity,
+    price,
+    low_stock_threshold
+  } = req.body;
 
   if (
-    !name || !sku ||
-    !Number.isInteger(Number(quantity)) || Number(quantity) < 0 ||
-    !Number.isFinite(Number(price)) || Number(price) < 0 ||
+    !name ||
+    !sku ||
+    !Number.isInteger(Number(quantity)) ||
+    Number(quantity) < 0 ||
+    !Number.isFinite(Number(price)) ||
+    Number(price) < 0 ||
     !Number.isInteger(Number(low_stock_threshold)) ||
     Number(low_stock_threshold) < 0
   ) {
@@ -296,16 +344,21 @@ app.put("/api/products/:id", authenticateToken, async (req, res) => {
 
     if (result.affectedRows === 0) {
       const [rows] = await pool.execute(
-        "SELECT id FROM products WHERE id = ? AND organization_id = ?",
+        `SELECT id FROM products
+         WHERE id = ? AND organization_id = ?`,
         [req.params.id, req.user.organizationId]
       );
 
       if (rows.length === 0) {
-        return res.status(404).json({ message: "Product not found" });
+        return res.status(404).json({
+          message: "Product not found"
+        });
       }
     }
 
-    res.json({ message: "Product updated successfully" });
+    res.json({
+      message: "Product updated successfully"
+    });
   } catch (error) {
     if (error.code === "ER_DUP_ENTRY") {
       return res.status(409).json({
@@ -313,27 +366,38 @@ app.put("/api/products/:id", authenticateToken, async (req, res) => {
       });
     }
 
-    console.error(error.message);
-    res.status(500).json({ message: "Could not update product" });
+    console.error("UPDATE PRODUCT ERROR:", error.message);
+
+    res.status(500).json({
+      message: "Could not update product"
+    });
   }
 });
 
-// Delete a product
+// Delete product
 app.delete("/api/products/:id", authenticateToken, async (req, res) => {
   try {
     const [result] = await pool.execute(
-      "DELETE FROM products WHERE id = ? AND organization_id = ?",
+      `DELETE FROM products
+       WHERE id = ? AND organization_id = ?`,
       [req.params.id, req.user.organizationId]
     );
 
     if (result.affectedRows === 0) {
-      return res.status(404).json({ message: "Product not found" });
+      return res.status(404).json({
+        message: "Product not found"
+      });
     }
 
-    res.json({ message: "Product deleted successfully" });
+    res.json({
+      message: "Product deleted successfully"
+    });
   } catch (error) {
-    console.error(error.message);
-    res.status(500).json({ message: "Could not delete product" });
+    console.error("DELETE PRODUCT ERROR:", error.message);
+
+    res.status(500).json({
+      message: "Could not delete product"
+    });
   }
 });
 
@@ -346,7 +410,10 @@ app.get("/api/dashboard", authenticateToken, async (req, res) => {
          COALESCE(SUM(quantity), 0) AS totalUnits,
          COALESCE(SUM(quantity * price), 0) AS inventoryValue,
          COALESCE(SUM(
-           CASE WHEN quantity <= low_stock_threshold THEN 1 ELSE 0 END
+           CASE
+             WHEN quantity <= low_stock_threshold THEN 1
+             ELSE 0
+           END
          ), 0) AS lowStockCount
        FROM products
        WHERE organization_id = ?`,
@@ -367,8 +434,11 @@ app.get("/api/dashboard", authenticateToken, async (req, res) => {
       lowStockProducts
     });
   } catch (error) {
-    console.error(error.message);
-    res.status(500).json({ message: "Could not load dashboard" });
+    console.error("DASHBOARD ERROR:", error.message);
+
+    res.status(500).json({
+      message: "Could not load dashboard"
+    });
   }
 });
 
@@ -376,5 +446,5 @@ app.get("/api/dashboard", authenticateToken, async (req, res) => {
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-  console.log(`StockFlow server running on http://localhost:${PORT}`);
+  console.log(`StockFlow server running on port ${PORT}`);
 });
