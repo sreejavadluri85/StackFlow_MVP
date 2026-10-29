@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 
-const API = "http://localhost:5000/api";
+const API = "https://stackflow-mvp-skxr.onrender.com/api";
 
 export default function App() {
   const [email, setEmail] = useState("test.stockflow@example.com");
