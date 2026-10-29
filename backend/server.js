@@ -21,7 +21,7 @@ const pool =mysql.createPool({
   connectionLimit: 10
 });
 
-// Check server and database
+// Check server and databaseA long, random secret of your own
 app.get("/api/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
